@@ -1,0 +1,111 @@
+/* ─── Layout ─── */
+.app {
+  max-width: 600px;
+  margin: 3rem auto;
+  padding: 2rem;
+  font-family: 'Segoe UI', sans-serif;
+  text-align: center;
+}
+
+h1 {
+  font-size: 1.8rem;
+  margin-bottom: 0.25rem;
+}
+
+/* ─── Status indicator ─── */
+.status {
+  font-size: 0.85rem;
+  margin-bottom: 1.5rem;
+  padding: 0.35rem 0.75rem;
+  border-radius: 20px;
+  display: inline-block;
+}
+.status.online {
+  background: #d4edda;
+  color: #155724;
+}
+.status.offline {
+  background: #f8d7da;
+  color: #721c24;
+}
+
+/* ─── Panels (Create / Join) ─── */
+.panels {
+  display: flex;
+  gap: 1.5rem;
+  justify-content: center;
+  flex-wrap: wrap;
+}
+
+.panel {
+  flex: 1;
+  min-width: 240px;
+  background: #1e1e2e;
+  border: 1px solid #333;
+  border-radius: 12px;
+  padding: 1.5rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.75rem;
+}
+
+.panel h2 {
+  margin: 0 0 0.5rem;
+  font-size: 1.1rem;
+}
+
+.panel input {
+  padding: 0.6rem 0.75rem;
+  border: 1px solid #444;
+  border-radius: 8px;
+  background: #2a2a3d;
+  color: #eee;
+  font-size: 0.9rem;
+}
+
+.panel input::placeholder {
+  color: #888;
+}
+
+.panel button {
+  padding: 0.65rem;
+  border: none;
+  border-radius: 8px;
+  background: #646cff;
+  color: #fff;
+  font-size: 0.95rem;
+  cursor: pointer;
+  transition: background 0.2s;
+}
+
+.panel button:hover:not(:disabled) {
+  background: #535bf2;
+}
+
+.panel button:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+/* ─── Player section ─── */
+.player-section {
+  margin-top: 1rem;
+}
+
+.room-key {
+  background: #1e1e2e;
+  padding: 0.75rem 1rem;
+  border-radius: 8px;
+  margin-bottom: 1.5rem;
+  font-size: 0.95rem;
+}
+
+.room-key strong {
+  color: #646cff;
+  user-select: all;
+}
+
+audio {
+  width: 100%;
+  margin-top: 0.5rem;
+}
