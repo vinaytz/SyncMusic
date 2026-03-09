@@ -12,8 +12,7 @@ const MusicRoom = () => {
 
   useEffect(() => {
     // 1. Initialize WebSocket Connection
-    socketRef.current = new WebSocket('ws://localhost:3000/');
-
+socketRef.current = new WebSocket('wss://syncmusic-production.up.railway.app/');
     socketRef.current.onopen = () => setStatus('Connected to Server');
 
     socketRef.current.onmessage = (event) => {
