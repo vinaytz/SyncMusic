@@ -1,8 +1,31 @@
 require("dotenv").config()
 const express = require('express');
+const cors = require('cors');
+const multer = require('multer');
 const { WebSocketServer } = require('ws');
-const {mp3Upload} = require("./musicUpload")
+const { mp3Upload } = require("./musicUpload");
+
 const app = express();
+app.use(cors());
+
+const upload = multer({ storage: multer.memoryStorage() });
+
+// ─── REST: Upload music file to ImageKit ───
+app.post('/upload', upload.single('music'), async (req, res) => {
+    try {
+        if (!req.file) return res.status(400).json({ error: 'No file provided' });
+
+        const base64 = req.file.buffer.toString('base64');
+        const url = await mp3Upload(base64, req.file.originalname);
+
+        if (!url) return res.status(500).json({ error: 'Upload failed' });
+        res.json({ url });
+    } catch (err) {
+        console.error('Upload error:', err);
+        res.status(500).json({ error: 'Upload failed' });
+    }
+});
+
 const server = app.listen(3000, () => console.log('Server running on port 3000'));
 
 // Create the WebSocket Server
@@ -26,15 +49,12 @@ wss.on('connection', (ws) => {
                     pauseTime: 0,            // stored timestamp (source of truth)
                     clients: new Set([ws])
                 };
-                ws.roomKey = roomKey; // Store key on the socket itself
-                console.log(rooms)
+                ws.roomKey = roomKey;
                 ws.send(JSON.stringify({ type: 'ROOM_CREATED', roomKey }));
                 break;
 
-            case 'JOIN_ROOM':
-                console.log("this is room", rooms)
+            case 'JOIN_ROOM': {
                 const room = rooms[message.roomKey];
-                console.log(room)
                 if (room && room.password === message.password) {
                     room.clients.add(ws);
                     ws.roomKey = message.roomKey;
@@ -43,22 +63,8 @@ wss.on('connection', (ws) => {
                     ws.send(JSON.stringify({ type: 'ERROR', message: 'Wrong key/password' }));
                 }
                 break;
+            }
 
-            // case 'CONTROL':
-            //     // Broadcast the play/pause signal to everyone in the room EXCEPT the sender
-            //     const currentRoom = rooms[ws.roomKey];
-            //     if (currentRoom) {
-            //         currentRoom.clients.forEach(client => {
-            //             if (client !== ws && client.readyState === 1) {
-            //                 client.send(JSON.stringify({
-            //                     type: 'SYNC_CONTROL',
-            //                     action: message.action, // 'PLAY' or 'PAUSE'
-            //                     time: message.time     // The exact timestamp
-            //                 }));
-            //             }
-            //         });
-            //     }
-            //     break;
             case 'CONTROL': {
                 const currentRoom = rooms[ws.roomKey];
                 if (!currentRoom) break;
