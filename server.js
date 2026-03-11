@@ -7,8 +7,63 @@ const { mp3Upload } = require("./musicUpload");
 
 const app = express();
 app.use(cors());
+app.use(express.json());
 
 const upload = multer({ storage: multer.memoryStorage() });
+
+// ─── Spotify: Client Credentials token cache ───
+let spotifyToken = null;
+let tokenExpiresAt = 0;
+
+async function getSpotifyToken() {
+    if (spotifyToken && Date.now() < tokenExpiresAt) return spotifyToken;
+
+    const res = await fetch('https://accounts.spotify.com/api/token', {
+        method: 'POST',
+        headers: {
+            'Content-Type': 'application/x-www-form-urlencoded',
+            'Authorization': 'Basic ' + Buffer.from(
+                process.env.SPOTIFY_CLIENT_ID + ':' + process.env.SPOTIFY_CLIENT_SECRET
+            ).toString('base64')
+        },
+        body: 'grant_type=client_credentials'
+    });
+
+    const data = await res.json();
+    spotifyToken = data.access_token;
+    tokenExpiresAt = Date.now() + (data.expires_in - 60) * 1000; // refresh 60s early
+    return spotifyToken;
+}
+
+// ─── REST: Search Spotify tracks ───
+app.get('/spotify/search', async (req, res) => {
+    try {
+        const { q } = req.query;
+        if (!q) return res.status(400).json({ error: 'Missing query param ?q=' });
+
+        const token = await getSpotifyToken();
+        const spotifyRes = await fetch(
+            `https://api.spotify.com/v1/search?q=${encodeURIComponent(q)}&type=track&limit=10`,
+            { headers: { 'Authorization': `Bearer ${token}` } }
+        );
+        const data = await spotifyRes.json();
+
+        const tracks = (data.tracks?.items || []).map(t => ({
+            id: t.id,
+            name: t.name,
+            artist: t.artists.map(a => a.name).join(', '),
+            album: t.album.name,
+            cover: t.album.images[1]?.url || t.album.images[0]?.url,
+            previewUrl: t.preview_url,           // 30-sec MP3 clip (may be null)
+            spotifyUrl: t.external_urls.spotify,
+        }));
+
+        res.json({ tracks });
+    } catch (err) {
+        console.error('Spotify search error:', err);
+        res.status(500).json({ error: 'Spotify search failed' });
+    }
+});
 
 // ─── REST: Upload music file to ImageKit ───
 app.post('/upload', upload.single('music'), async (req, res) => {
