@@ -1,6 +1,6 @@
 import { useState, useEffect, useRef } from 'react';
 import {
-  Music, Upload, Play, Pause, Radio, Copy, Check, Loader2, Users, LogIn, Plus, Wifi, WifiOff
+  Music, Upload, Play, Pause, Radio, Copy, Check, Loader2, Users, LogIn, Plus, Wifi, WifiOff, Search, X, Disc3
 } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
@@ -23,6 +23,13 @@ export default function App() {
   const [password, setPassword] = useState('');
   const [file, setFile] = useState(null);
   const [uploading, setUploading] = useState(false);
+  const [musicSource, setMusicSource] = useState('upload'); // 'upload' | 'spotify'
+
+  // Spotify search
+  const [searchQuery, setSearchQuery] = useState('');
+  const [searchResults, setSearchResults] = useState([]);
+  const [searching, setSearching] = useState(false);
+  const [selectedTrack, setSelectedTrack] = useState(null);
 
   // Join room form
   const [joinKey, setJoinKey] = useState('');
@@ -85,24 +92,46 @@ export default function App() {
 
   // ─── Upload & Create Room ───
   const handleCreate = async () => {
-    if (!file || !password) return;
-    setUploading(true);
+    if (!password) return;
 
+    if (musicSource === 'spotify') {
+      // Spotify: use the preview URL directly
+      if (!selectedTrack?.previewUrl) return;
+      setSongName(`${selectedTrack.name} — ${selectedTrack.artist}`);
+      send({ type: 'CREATE_ROOM', password, musicUrl: selectedTrack.previewUrl });
+      return;
+    }
+
+    // Upload: upload file to ImageKit
+    if (!file) return;
+    setUploading(true);
     try {
       const formData = new FormData();
       formData.append('music', file);
-
       const res = await fetch(`${API_URL}/upload`, { method: 'POST', body: formData });
       const { url } = await res.json();
-
       if (!url) throw new Error('Upload failed');
-
       setSongName(file.name);
       send({ type: 'CREATE_ROOM', password, musicUrl: url });
     } catch (err) {
       alert('Upload failed. Try again.');
     } finally {
       setUploading(false);
+    }
+  };
+
+  // ─── Spotify search ───
+  const handleSearch = async () => {
+    if (!searchQuery.trim()) return;
+    setSearching(true);
+    try {
+      const res = await fetch(`${API_URL}/spotify/search?q=${encodeURIComponent(searchQuery)}`);
+      const { tracks } = await res.json();
+      setSearchResults(tracks || []);
+    } catch {
+      alert('Search failed');
+    } finally {
+      setSearching(false);
     }
   };
 
@@ -170,27 +199,118 @@ export default function App() {
   }
 
   if (view === 'create') {
+    const canCreate = password && connected && !uploading &&
+      (musicSource === 'upload' ? !!file : !!selectedTrack?.previewUrl);
+
     return (
       <Shell connected={connected}>
         <Card className="w-full max-w-md">
           <CardHeader>
             <CardTitle className="flex items-center gap-2"><Plus className="h-5 w-5 text-violet-400" /> Create Room</CardTitle>
-            <CardDescription>Upload a song and set a password. Share the key with friends.</CardDescription>
+            <CardDescription>Pick a song and set a password. Share the key with friends.</CardDescription>
           </CardHeader>
           <CardContent className="flex flex-col gap-4">
-            {/* File picker */}
-            <label className="group flex flex-col items-center gap-3 rounded-xl border-2 border-dashed border-zinc-700 p-6 cursor-pointer hover:border-violet-500/50 transition-colors">
-              <Upload className="h-8 w-8 text-zinc-500 group-hover:text-violet-400 transition-colors" />
-              <span className="text-sm text-zinc-400">
-                {file ? file.name : 'Click to select an MP3 file'}
-              </span>
-              <input
-                type="file"
-                accept="audio/*"
-                className="hidden"
-                onChange={(e) => setFile(e.target.files[0])}
-              />
-            </label>
+
+            {/* ── Source tabs ── */}
+            <div className="flex rounded-lg bg-zinc-800 p-1 gap-1">
+              <button
+                onClick={() => { setMusicSource('upload'); setSelectedTrack(null); }}
+                className={`flex-1 flex items-center justify-center gap-1.5 rounded-md px-3 py-2 text-sm font-medium transition-colors cursor-pointer ${
+                  musicSource === 'upload' ? 'bg-zinc-700 text-white' : 'text-zinc-400 hover:text-zinc-200'
+                }`}
+              >
+                <Upload className="h-4 w-4" /> Upload
+              </button>
+              <button
+                onClick={() => { setMusicSource('spotify'); setFile(null); }}
+                className={`flex-1 flex items-center justify-center gap-1.5 rounded-md px-3 py-2 text-sm font-medium transition-colors cursor-pointer ${
+                  musicSource === 'spotify' ? 'bg-emerald-600 text-white' : 'text-zinc-400 hover:text-zinc-200'
+                }`}
+              >
+                <Disc3 className="h-4 w-4" /> Spotify
+              </button>
+            </div>
+
+            {/* ── Upload tab ── */}
+            {musicSource === 'upload' && (
+              <label className="group flex flex-col items-center gap-3 rounded-xl border-2 border-dashed border-zinc-700 p-6 cursor-pointer hover:border-violet-500/50 transition-colors">
+                <Upload className="h-8 w-8 text-zinc-500 group-hover:text-violet-400 transition-colors" />
+                <span className="text-sm text-zinc-400">
+                  {file ? file.name : 'Click to select an MP3 file'}
+                </span>
+                <input
+                  type="file"
+                  accept="audio/*"
+                  className="hidden"
+                  onChange={(e) => setFile(e.target.files[0])}
+                />
+              </label>
+            )}
+
+            {/* ── Spotify tab ── */}
+            {musicSource === 'spotify' && (
+              <div className="flex flex-col gap-3">
+                {/* Search bar */}
+                <div className="flex gap-2">
+                  <Input
+                    placeholder="Search for a song..."
+                    value={searchQuery}
+                    onChange={(e) => setSearchQuery(e.target.value)}
+                    onKeyDown={(e) => e.key === 'Enter' && handleSearch()}
+                  />
+                  <Button variant="outline" size="icon" onClick={handleSearch} disabled={searching}>
+                    {searching ? <Loader2 className="h-4 w-4 animate-spin" /> : <Search className="h-4 w-4" />}
+                  </Button>
+                </div>
+
+                {/* Selected track */}
+                {selectedTrack && (
+                  <div className="flex items-center gap-3 rounded-lg bg-emerald-500/10 border border-emerald-500/20 p-3">
+                    <img src={selectedTrack.cover} alt="" className="h-10 w-10 rounded object-cover" />
+                    <div className="flex-1 min-w-0">
+                      <p className="text-sm font-medium text-white truncate">{selectedTrack.name}</p>
+                      <p className="text-xs text-zinc-400 truncate">{selectedTrack.artist}</p>
+                    </div>
+                    <button onClick={() => setSelectedTrack(null)} className="text-zinc-500 hover:text-white cursor-pointer">
+                      <X className="h-4 w-4" />
+                    </button>
+                  </div>
+                )}
+
+                {/* Results list */}
+                {searchResults.length > 0 && !selectedTrack && (
+                  <div className="max-h-60 overflow-y-auto rounded-lg border border-zinc-800 divide-y divide-zinc-800">
+                    {searchResults.map((track) => (
+                      <button
+                        key={track.id}
+                        onClick={() => { setSelectedTrack(track); setSearchResults([]); }}
+                        disabled={!track.previewUrl}
+                        className={`flex w-full items-center gap-3 p-3 text-left transition-colors ${
+                          track.previewUrl
+                            ? 'hover:bg-zinc-800 cursor-pointer'
+                            : 'opacity-40 cursor-not-allowed'
+                        }`}
+                      >
+                        <img src={track.cover} alt="" className="h-10 w-10 rounded object-cover" />
+                        <div className="flex-1 min-w-0">
+                          <p className="text-sm font-medium text-white truncate">{track.name}</p>
+                          <p className="text-xs text-zinc-400 truncate">{track.artist}</p>
+                        </div>
+                        {!track.previewUrl && (
+                          <span className="text-[10px] text-zinc-600 shrink-0">No preview</span>
+                        )}
+                      </button>
+                    ))}
+                  </div>
+                )}
+
+                {musicSource === 'spotify' && selectedTrack && (
+                  <p className="text-xs text-zinc-500 text-center">
+                    Spotify free tier provides 30-second preview clips
+                  </p>
+                )}
+              </div>
+            )}
 
             <Input
               type="password"
@@ -202,7 +322,7 @@ export default function App() {
             <Button
               variant="primary"
               onClick={handleCreate}
-              disabled={!file || !password || !connected || uploading}
+              disabled={!canCreate}
             >
               {uploading ? <><Loader2 className="h-4 w-4 animate-spin" /> Uploading...</> : 'Create Room'}
             </Button>
@@ -272,7 +392,7 @@ export default function App() {
             </div>
             <div>
               <p className="font-medium text-white">Create a Room</p>
-              <p className="text-sm text-zinc-500">Upload a song and invite others</p>
+              <p className="text-sm text-zinc-500">Upload a song or pick from Spotify</p>
             </div>
           </CardContent>
         </Card>
