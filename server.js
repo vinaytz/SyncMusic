@@ -30,8 +30,14 @@ async function getSpotifyToken() {
     });
 
     const data = await res.json();
+
+    if (!data.access_token) {
+        console.error('Spotify token error:', data);
+        throw new Error('Failed to get Spotify token');
+    }
+
     spotifyToken = data.access_token;
-    tokenExpiresAt = Date.now() + (data.expires_in - 60) * 1000; // refresh 60s early
+    tokenExpiresAt = Date.now() + (data.expires_in - 60) * 1000;
     return spotifyToken;
 }
 
@@ -41,12 +47,29 @@ app.get('/spotify/search', async (req, res) => {
         const { q } = req.query;
         if (!q) return res.status(400).json({ error: 'Missing query param ?q=' });
 
-        const token = await getSpotifyToken();
-        const spotifyRes = await fetch(
+        let token = await getSpotifyToken();
+        let spotifyRes = await fetch(
             `https://api.spotify.com/v1/search?q=${encodeURIComponent(q)}&type=track&limit=10`,
             { headers: { 'Authorization': `Bearer ${token}` } }
         );
+
+        // If token expired mid-session, clear cache and retry once
+        if (spotifyRes.status === 401) {
+            spotifyToken = null;
+            tokenExpiresAt = 0;
+            token = await getSpotifyToken();
+            spotifyRes = await fetch(
+                `https://api.spotify.com/v1/search?q=${encodeURIComponent(q)}&type=track&limit=10`,
+                { headers: { 'Authorization': `Bearer ${token}` } }
+            );
+        }
+
         const data = await spotifyRes.json();
+
+        if (data.error) {
+            console.error('Spotify API error:', data.error);
+            return res.status(data.error.status || 500).json({ error: data.error.message });
+        }
 
         const tracks = (data.tracks?.items || []).map(t => ({
             id: t.id,
@@ -54,13 +77,13 @@ app.get('/spotify/search', async (req, res) => {
             artist: t.artists.map(a => a.name).join(', '),
             album: t.album.name,
             cover: t.album.images[1]?.url || t.album.images[0]?.url,
-            previewUrl: t.preview_url,           // 30-sec MP3 clip (may be null)
+            previewUrl: t.preview_url,
             spotifyUrl: t.external_urls.spotify,
         }));
 
         res.json({ tracks });
     } catch (err) {
-        console.error('Spotify search error:', err);
+        console.error('Spotify search error:', err.message);
         res.status(500).json({ error: 'Spotify search failed' });
     }
 });
