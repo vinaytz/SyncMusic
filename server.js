@@ -23,7 +23,8 @@ wss.on('connection', (ws) => {
                 rooms[roomKey] = {
                     password: message.password,
                     musicUrl: message.musicUrl,
-                    clients: new Set([ws]) // Track who is in the room
+                    pauseTime: 0,            // stored timestamp (source of truth)
+                    clients: new Set([ws])
                 };
                 ws.roomKey = roomKey; // Store key on the socket itself
                 console.log(rooms)
@@ -58,22 +59,43 @@ wss.on('connection', (ws) => {
             //         });
             //     }
             //     break;
-            case 'CONTROL':
-    const currentRoom = rooms[ws.roomKey];
-    if (currentRoom) {
-        currentRoom.clients.forEach(client => {
-            if (client !== ws && client.readyState === 1) {
-                client.send(JSON.stringify({
-                    type: 'SYNC_CONTROL',
-                    action: message.action,
-                    time: message.time,
-                    // Send the server's current high-resolution timestamp
-                    serverTime: Date.now() 
-                }));
+            case 'CONTROL': {
+                const currentRoom = rooms[ws.roomKey];
+                if (!currentRoom) break;
+
+                if (message.action === 'PAUSE') {
+                    // Store the pause timestamp — this is now the single source of truth
+                    currentRoom.pauseTime = message.time;
+
+                    // Broadcast PAUSE + time to ALL clients (including sender)
+                    currentRoom.clients.forEach(client => {
+                        if (client.readyState === 1) {
+                            client.send(JSON.stringify({
+                                type: 'SYNC_CONTROL',
+                                action: 'PAUSE',
+                                time: currentRoom.pauseTime
+                            }));
+                        }
+                    });
+                }
+
+                if (message.action === 'PLAY') {
+                    // FE doesn't send time — server uses the stored pauseTime
+                    const playFrom = currentRoom.pauseTime || 0;
+
+                    // Broadcast PLAY + stored time to ALL clients (including sender)
+                    currentRoom.clients.forEach(client => {
+                        if (client.readyState === 1) {
+                            client.send(JSON.stringify({
+                                type: 'SYNC_CONTROL',
+                                action: 'PLAY',
+                                time: playFrom
+                            }));
+                        }
+                    });
+                }
+                break;
             }
-        });
-    }
-    break;
         }
     });
 

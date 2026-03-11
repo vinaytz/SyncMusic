@@ -1,28 +1,28 @@
-import React, { useState, useEffect, useRef } from 'react';
+import { useState, useEffect, useRef } from 'react';
 
 const MusicRoom = () => {
   const [roomKey, setRoomKey] = useState('');
   const [inputKey, setInputKey] = useState('');
   const [isJoined, setIsJoined] = useState(false);
+  const [isPlaying, setIsPlaying] = useState(false);
   const [status, setStatus] = useState('Disconnected');
 
-  // Refs: These don't trigger re-renders, perfect for "heavy" objects
   const socketRef = useRef(null);
   const audioRef = useRef(new Audio());
 
   useEffect(() => {
-    // 1. Initialize WebSocket Connection
-socketRef.current = new WebSocket('wss://syncmusic-production.up.railway.app/');
-    socketRef.current.onopen = () => setStatus('Connected to Server');
+    const socket = new WebSocket('wss://syncmusic-production.up.railway.app/');
+    socketRef.current = socket;
 
-    socketRef.current.onmessage = (event) => {
-      const data = JSON.parse(event.data);
+    socket.onopen = () => setStatus('Connected to Server');
 
-      switch (data.type) {
+    socket.onmessage = (event) => {
+      const { type, ...data } = JSON.parse(event.data);
+
+      switch (type) {
         case 'ROOM_CREATED':
           setRoomKey(data.roomKey);
           setIsJoined(true);
-          console.log(data.roomKey)
           break;
 
         case 'JOIN_SUCCESS':
@@ -30,86 +30,71 @@ socketRef.current = new WebSocket('wss://syncmusic-production.up.railway.app/');
           setIsJoined(true);
           break;
 
-        // case 'SYNC_CONTROL':
-        //   // Critical: Sync time first, then play/pause
-        //   audioRef.current.currentTime = data.time;
-        //   if (data.action === 'PLAY') audioRef.current.play();
-        //   if (data.action === 'PAUSE') audioRef.current.pause();
-        //   break;
-
-        case 'SYNC_CONTROL': {
-    const { action, time, serverTime } = data;
-    
-    // 1. Calculate how long the message took to arrive
-    // Note: This is a simple version. Pro apps do a "ping" to sync clocks.
-    const delayInMs = Date.now() - serverTime;
-    const delayInSeconds = delayInMs / 1000;
-
-    if (action === 'PLAY') {
-        // 2. Adjust the audio position to account for the transit time
-        // If the message took 0.2s to arrive, we should start 0.2s further into the song
-        audioRef.current.currentTime = time + delayInSeconds;
-        audioRef.current.play();
-    } else if (action === 'PAUSE') {
-        // For pause, we just snap to the exact time the sender paused at
-        audioRef.current.currentTime = time;
-        audioRef.current.pause();
-    }
-    break;
-}
+        case 'SYNC_CONTROL':
+          // Server is the source of truth — just obey what it says
+          audioRef.current.currentTime = data.time;
+          if (data.action === 'PLAY') {
+            audioRef.current.play();
+            setIsPlaying(true);
+          } else {
+            audioRef.current.pause();
+            setIsPlaying(false);
+          }
+          break;
 
         case 'ERROR':
           alert(data.message);
           break;
-          
-        default: break;
       }
     };
 
-    // Cleanup on unmount
     return () => {
-      socketRef.current.close();
+      socket.close();
       audioRef.current.pause();
     };
   }, []);
 
-  // --- Handlers ---
+  // ─── Send helper ───
+  const send = (payload) => {
+    const { current: ws } = socketRef;
+    if (ws?.readyState === WebSocket.OPEN) ws.send(JSON.stringify(payload));
+  };
 
+  // ─── Room actions ───
   const createRoom = () => {
-    // In a real app, upload to ImageKit first, then get this URL
-    const demoUrl = "https://www.soundhelix.com/examples/mp3/SoundHelix-Song-1.mp3"; 
-    
-    socketRef.current.send(JSON.stringify({
+    send({
       type: 'CREATE_ROOM',
-      password: '123', // Hardcoded for learning
-      musicUrl: demoUrl
-    }));
+      password: '123',
+      musicUrl: 'https://www.soundhelix.com/examples/mp3/SoundHelix-Song-1.mp3'
+    });
   };
 
   const joinRoom = () => {
-    socketRef.current.send(JSON.stringify({
-      type: 'JOIN_ROOM',
-      roomKey: inputKey,
-      password: '123'
-    }));
+    send({ type: 'JOIN_ROOM', roomKey: inputKey, password: '123' });
   };
 
-  const handleTogglePlay = () => {
-    const isPaused = audioRef.current.paused;
-    const action = isPaused ? 'PLAY' : 'PAUSE';
-    
-    // 1. Update local UI immediately for responsiveness
-    if (isPaused) audioRef.current.play();
-    else audioRef.current.pause();
+  // ─── Play / Pause ───
+  // FE does NOT touch the audio element here.
+  // It only sends a command. The server will broadcast SYNC_CONTROL
+  // back to ALL clients (including this one), and that handler above
+  // actually plays/pauses the audio — guaranteeing 100% sync.
 
-    // 2. Inform the server to sync everyone else
-    socketRef.current.send(JSON.stringify({
+  const handlePause = () => {
+    send({
       type: 'CONTROL',
-      action: action,
-      time: audioRef.current.currentTime
-    }));
+      action: 'PAUSE',
+      time: audioRef.current.currentTime   // send where we paused
+    });
   };
 
+  const handlePlay = () => {
+    send({
+      type: 'CONTROL',
+      action: 'PLAY'                        // no time — server uses stored pauseTime
+    });
+  };
+
+  // ─── UI ───
   return (
     <div style={{ padding: '20px', fontFamily: 'sans-serif' }}>
       <h2>Music Sync Demo</h2>
@@ -119,18 +104,21 @@ socketRef.current = new WebSocket('wss://syncmusic-production.up.railway.app/');
         <div>
           <button onClick={createRoom}>Create New Room</button>
           <hr />
-          <input 
-            placeholder="Enter Room Key" 
-            value={inputKey} 
-            onChange={(e) => setInputKey(e.target.value)} 
+          <input
+            placeholder="Enter Room Key"
+            value={inputKey}
+            onChange={(e) => setInputKey(e.target.value)}
           />
           <button onClick={joinRoom}>Join Room</button>
         </div>
       ) : (
         <div>
           <h3>Room: {roomKey || inputKey}</h3>
-          <button onClick={handleTogglePlay} style={{ fontSize: '20px', padding: '10px 20px' }}>
-            Play / Pause
+          <button
+            onClick={isPlaying ? handlePause : handlePlay}
+            style={{ fontSize: '20px', padding: '10px 20px' }}
+          >
+            {isPlaying ? '⏸ Pause' : '▶ Play'}
           </button>
           <p>Tip: Open this in two tabs to see the sync!</p>
         </div>
