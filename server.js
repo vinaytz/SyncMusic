@@ -104,7 +104,8 @@ app.post('/upload', upload.single('music'), async (req, res) => {
     }
 });
 
-const server = app.listen(3000, () => console.log('Server running on port 3000'));
+const PORT = process.env.PORT || 3000;
+const server = app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
 
 // Create the WebSocket Server
 const wss = new WebSocketServer({ server });
