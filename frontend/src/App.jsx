@@ -38,19 +38,96 @@ export default function App() {
   // Refs
   const socketRef = useRef(null);
   const audioRef = useRef(new Audio());
+  const clockOffsetRef = useRef(0);
+  const playTimeoutRef = useRef(null);
+  const driftIntervalRef = useRef(null);
+  const syncStateRef = useRef({ startAt: 0, playFrom: 0 });
 
-  // ─── WebSocket connection ───
+  // ─── WebSocket connection + clock sync ───
   useEffect(() => {
     const socket = new WebSocket(WS_URL);
     socketRef.current = socket;
+    audioRef.current.preload = 'auto';
 
-    socket.onopen = () => setConnected(true);
+    // ── NTP-style clock sync state ──
+    let syncSamples = [];
+    let syncResolve = null;
+    let resyncTimer = null;
+
+    const sendPing = () => {
+      if (socket.readyState === WebSocket.OPEN) {
+        socket.send(JSON.stringify({ type: 'PING', clientTime: Date.now() }));
+      }
+    };
+
+    const startClockSync = () =>
+      new Promise((resolve) => {
+        syncSamples = [];
+        syncResolve = resolve;
+        sendPing();
+      });
+
+    // ── Drift correction (runs while playing) ──
+    const startDriftCorrection = () => {
+      stopDriftCorrection();
+      driftIntervalRef.current = setInterval(() => {
+        const audio = audioRef.current;
+        if (!audio || audio.paused) return;
+        const { startAt, playFrom } = syncStateRef.current;
+        if (!startAt) return;
+        const serverNow = Date.now() + clockOffsetRef.current;
+        const expectedTime = playFrom + (serverNow - startAt) / 1000;
+        const drift = audio.currentTime - expectedTime;
+        if (Math.abs(drift) > 0.05) {
+          audio.currentTime = expectedTime;
+        }
+      }, 2000);
+    };
+
+    const stopDriftCorrection = () => {
+      if (driftIntervalRef.current) {
+        clearInterval(driftIntervalRef.current);
+        driftIntervalRef.current = null;
+      }
+    };
+
+    socket.onopen = () => {
+      setConnected(true);
+      startClockSync().then((offset) => {
+        clockOffsetRef.current = offset;
+      });
+      resyncTimer = setInterval(() => {
+        if (socket.readyState === WebSocket.OPEN) {
+          startClockSync().then((offset) => {
+            clockOffsetRef.current = offset;
+          });
+        }
+      }, 10_000);
+    };
+
     socket.onclose = () => setConnected(false);
 
     socket.onmessage = (event) => {
       const { type, ...data } = JSON.parse(event.data);
 
       switch (type) {
+        case 'PONG': {
+          const t3 = Date.now();
+          const t1 = data.clientTime;
+          const t2 = data.serverTime;
+          const rtt = t3 - t1;
+          const offset = ((t2 - t1) + (t2 - t3)) / 2;
+          syncSamples.push({ offset, rtt });
+          if (syncSamples.length < 5) {
+            setTimeout(sendPing, 50);
+          } else if (syncResolve) {
+            syncSamples.sort((a, b) => a.rtt - b.rtt);
+            syncResolve(syncSamples[0].offset);
+            syncResolve = null;
+          }
+          break;
+        }
+
         case 'ROOM_CREATED':
           setRoomKey(data.roomKey);
           setView('room');
@@ -60,18 +137,51 @@ export default function App() {
           audioRef.current.src = data.musicUrl;
           setSongName(data.musicUrl.split('/').pop().split('?')[0]);
           setView('room');
+          if (data.isPlaying && data.currentTime != null) {
+            const audio = audioRef.current;
+            const catchUp = () => {
+              audio.removeEventListener('canplay', catchUp);
+              audio.currentTime = data.currentTime;
+              audio.play();
+              setIsPlaying(true);
+            };
+            audio.addEventListener('canplay', catchUp);
+          }
           break;
 
-        case 'SYNC_CONTROL':
-          audioRef.current.currentTime = data.time;
+        case 'SYNC_CONTROL': {
+          if (playTimeoutRef.current) {
+            clearTimeout(playTimeoutRef.current);
+            playTimeoutRef.current = null;
+          }
+
           if (data.action === 'PLAY') {
-            audioRef.current.play();
-            setIsPlaying(true);
+            syncStateRef.current = { startAt: data.startAt, playFrom: data.time };
+            const localStart = data.startAt - clockOffsetRef.current;
+            const delay = localStart - Date.now();
+
+            audioRef.current.currentTime = data.time;
+
+            if (delay > 0) {
+              playTimeoutRef.current = setTimeout(() => {
+                audioRef.current.play();
+                setIsPlaying(true);
+                startDriftCorrection();
+              }, delay);
+            } else {
+              audioRef.current.currentTime = data.time + Math.abs(delay) / 1000;
+              audioRef.current.play();
+              setIsPlaying(true);
+              startDriftCorrection();
+            }
           } else {
+            stopDriftCorrection();
             audioRef.current.pause();
+            audioRef.current.currentTime = data.time;
             setIsPlaying(false);
           }
           break;
+        }
 
         case 'ERROR':
           alert(data.message);
@@ -80,6 +190,9 @@ export default function App() {
     };
 
     return () => {
+      clearInterval(resyncTimer);
+      stopDriftCorrection();
+      if (playTimeoutRef.current) clearTimeout(playTimeoutRef.current);
       socket.close();
       audioRef.current.pause();
     };
