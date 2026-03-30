@@ -114,6 +114,9 @@ const rooms = {};
 
 wss.on('connection', (ws) => {
     console.log('New device connected');
+    ws.isAlive = true;
+
+    ws.on('pong', () => { ws.isAlive = true; });
 
     ws.on('message', (data) => {
         const message = JSON.parse(data);
@@ -131,9 +134,11 @@ wss.on('connection', (ws) => {
                 const roomKey = Math.random().toString(36).substring(7);
                 rooms[roomKey] = {
                     password: message.password,
-                    musicUrl: message.musicUrl,
+                    musicUrl: message.musicUrl || '',
                     songName: message.songName || '',
                     coverArt: message.coverArt || '',
+                    roomType: message.roomType || 'audio',
+                    videoId: message.videoId || '',
                     pauseTime: 0,
                     isPlaying: false,
                     playStartServerTime: 0,
@@ -154,7 +159,9 @@ wss.on('connection', (ws) => {
                         type: 'JOIN_SUCCESS',
                         musicUrl: room.musicUrl,
                         songName: room.songName,
-                        coverArt: room.coverArt
+                        coverArt: room.coverArt,
+                        roomType: room.roomType,
+                        videoId: room.videoId
                     };
                     if (room.isPlaying && room.playStartServerTime) {
                         const elapsed = (Date.now() - room.playStartServerTime) / 1000;
@@ -239,6 +246,72 @@ wss.on('connection', (ws) => {
                 break;
             }
 
+            case 'VIDEO_CONTROL': {
+                const vidRoom = rooms[ws.roomKey];
+                if (!vidRoom || vidRoom.roomType !== 'youtube') break;
+
+                if (message.action === 'PAUSE') {
+                    vidRoom.pauseTime = message.time;
+                    vidRoom.isPlaying = false;
+                    vidRoom.clients.forEach(client => {
+                        if (client.readyState === 1) {
+                            client.send(JSON.stringify({
+                                type: 'VIDEO_SYNC',
+                                action: 'PAUSE',
+                                time: vidRoom.pauseTime
+                            }));
+                        }
+                    });
+                }
+                if (message.action === 'PLAY') {
+                    const playFrom = vidRoom.pauseTime || 0;
+                    const startAt = Date.now() + 600;
+                    vidRoom.isPlaying = true;
+                    vidRoom.playStartServerTime = startAt;
+                    vidRoom.playStartPosition = playFrom;
+                    vidRoom.clients.forEach(client => {
+                        if (client.readyState === 1) {
+                            client.send(JSON.stringify({
+                                type: 'VIDEO_SYNC',
+                                action: 'PLAY',
+                                time: playFrom,
+                                startAt
+                            }));
+                        }
+                    });
+                }
+                if (message.action === 'SEEK') {
+                    const seekTo = message.time;
+                    if (vidRoom.isPlaying) {
+                        const startAt = Date.now() + 400;
+                        vidRoom.playStartServerTime = startAt;
+                        vidRoom.playStartPosition = seekTo;
+                        vidRoom.clients.forEach(client => {
+                            if (client.readyState === 1) {
+                                client.send(JSON.stringify({
+                                    type: 'VIDEO_SYNC',
+                                    action: 'PLAY',
+                                    time: seekTo,
+                                    startAt
+                                }));
+                            }
+                        });
+                    } else {
+                        vidRoom.pauseTime = seekTo;
+                        vidRoom.clients.forEach(client => {
+                            if (client.readyState === 1) {
+                                client.send(JSON.stringify({
+                                    type: 'VIDEO_SYNC',
+                                    action: 'PAUSE',
+                                    time: seekTo
+                                }));
+                            }
+                        });
+                    }
+                }
+                break;
+            }
+
             case 'CHAT': {
                 const chatRoom = rooms[ws.roomKey];
                 if (!chatRoom) break;
@@ -281,4 +354,15 @@ function broadcastListenerCount(roomKey) {
         }
     });
 }
+
+// Server-side keep-alive: ping every 25s, terminate dead connections
+const keepAliveInterval = setInterval(() => {
+    wss.clients.forEach((ws) => {
+        if (ws.isAlive === false) return ws.terminate();
+        ws.isAlive = false;
+        ws.ping();
+    });
+}, 25_000);
+
+wss.on('close', () => clearInterval(keepAliveInterval));
 

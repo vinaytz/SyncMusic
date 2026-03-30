@@ -1,7 +1,7 @@
 import { useState, useEffect, useRef, useCallback } from 'react';
 import {
   Music, Upload, Play, Pause, Radio, Copy, Check, Loader2, Users, LogIn, Plus, Wifi, WifiOff, Search, X, Disc3,
-  Volume2, VolumeX, Send, SkipBack, SkipForward, MessageCircle
+  Volume2, VolumeX, Send, SkipBack, SkipForward, MessageCircle, Youtube
 } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
@@ -24,7 +24,12 @@ export default function App() {
   const [password, setPassword] = useState('');
   const [file, setFile] = useState(null);
   const [uploading, setUploading] = useState(false);
-  const [musicSource, setMusicSource] = useState('upload'); // 'upload' | 'spotify'
+  const [musicSource, setMusicSource] = useState('upload'); // 'upload' | 'spotify' | 'youtube'
+
+  // YouTube
+  const [youtubeUrl, setYoutubeUrl] = useState('');
+  const [videoId, setVideoId] = useState('');
+  const [roomType, setRoomType] = useState('audio'); // 'audio' | 'youtube'
 
   // Spotify search
   const [searchQuery, setSearchQuery] = useState('');
@@ -61,20 +66,23 @@ export default function App() {
   const audioCtxRef = useRef(null);
   const sourceNodeRef = useRef(null);
   const chatEndRef = useRef(null);
+  const ytPlayerRef = useRef(null);
+  const ytReadyRef = useRef(false);
+  const ytDriftRef = useRef(null);
 
-  // ─── WebSocket connection + clock sync ───
+  // ─── WebSocket connection + clock sync + auto-reconnect ───
   useEffect(() => {
-    const socket = new WebSocket(WS_URL);
-    socketRef.current = socket;
     audioRef.current.preload = 'auto';
-
-    // ── NTP-style clock sync state ──
+    let socket = null;
     let syncSamples = [];
     let syncResolve = null;
     let resyncTimer = null;
+    let heartbeatTimer = null;
+    let reconnectTimer = null;
+    let intentionalClose = false;
 
     const sendPing = () => {
-      if (socket.readyState === WebSocket.OPEN) {
+      if (socket && socket.readyState === WebSocket.OPEN) {
         socket.send(JSON.stringify({ type: 'PING', clientTime: Date.now() }));
       }
     };
@@ -110,23 +118,50 @@ export default function App() {
       }
     };
 
-    socket.onopen = () => {
-      setConnected(true);
-      startClockSync().then((offset) => {
-        clockOffsetRef.current = offset;
-      });
-      resyncTimer = setInterval(() => {
-        if (socket.readyState === WebSocket.OPEN) {
-          startClockSync().then((offset) => {
-            clockOffsetRef.current = offset;
-          });
+    function connect() {
+      if (socket && (socket.readyState === WebSocket.OPEN || socket.readyState === WebSocket.CONNECTING)) return;
+
+      socket = new WebSocket(WS_URL);
+      socketRef.current = socket;
+
+      socket.onopen = () => {
+        setConnected(true);
+        startClockSync().then((offset) => {
+          clockOffsetRef.current = offset;
+        });
+        // Re-sync clocks every 10s
+        clearInterval(resyncTimer);
+        resyncTimer = setInterval(() => {
+          if (socket.readyState === WebSocket.OPEN) {
+            startClockSync().then((offset) => {
+              clockOffsetRef.current = offset;
+            });
+          }
+        }, 10_000);
+        // Heartbeat every 20s to keep mobile connections alive
+        clearInterval(heartbeatTimer);
+        heartbeatTimer = setInterval(() => {
+          if (socket.readyState === WebSocket.OPEN) {
+            socket.send(JSON.stringify({ type: 'PING', clientTime: Date.now() }));
+          }
+        }, 20_000);
+      };
+
+      socket.onclose = () => {
+        setConnected(false);
+        clearInterval(resyncTimer);
+        clearInterval(heartbeatTimer);
+        // Auto-reconnect unless we intentionally closed
+        if (!intentionalClose) {
+          reconnectTimer = setTimeout(connect, 1500);
         }
-      }, 10_000);
-    };
+      };
 
-    socket.onclose = () => setConnected(false);
+      socket.onerror = () => {
+        // onclose will fire after this, triggering reconnect
+      };
 
-    socket.onmessage = (event) => {
+      socket.onmessage = (event) => {
       const { type, ...data } = JSON.parse(event.data);
 
       switch (type) {
@@ -153,19 +188,35 @@ export default function App() {
           break;
 
         case 'JOIN_SUCCESS':
-          audioRef.current.src = data.musicUrl;
-          setSongName(data.songName || data.musicUrl.split('/').pop().split('?')[0]);
+          setSongName(data.songName || data.musicUrl?.split('/').pop().split('?')[0] || 'YouTube Video');
           if (data.coverArt) setCoverArt(data.coverArt);
+          if (data.roomType === 'youtube' && data.videoId) {
+            setRoomType('youtube');
+            setVideoId(data.videoId);
+          } else {
+            setRoomType('audio');
+            audioRef.current.src = data.musicUrl;
+          }
           setView('room');
           if (data.isPlaying && data.currentTime != null) {
-            const audio = audioRef.current;
-            const catchUp = () => {
-              audio.removeEventListener('canplay', catchUp);
-              audio.currentTime = data.currentTime;
-              audio.play();
-              setIsPlaying(true);
-            };
-            audio.addEventListener('canplay', catchUp);
+            if (data.roomType === 'youtube') {
+              // YouTube late-join: dispatch event once player is ready
+              const waitForYt = () => {
+                window.dispatchEvent(new CustomEvent('yt-sync', {
+                  detail: { action: 'PLAY', time: data.currentTime, startAt: Date.now() + 500 }
+                }));
+              };
+              setTimeout(waitForYt, 2000);
+            } else {
+              const audio = audioRef.current;
+              const catchUp = () => {
+                audio.removeEventListener('canplay', catchUp);
+                audio.currentTime = data.currentTime;
+                audio.play();
+                setIsPlaying(true);
+              };
+              audio.addEventListener('canplay', catchUp);
+            }
           }
           break;
 
@@ -214,16 +265,46 @@ export default function App() {
         case 'CHAT':
           setChatMessages(prev => [...prev.slice(-100), data]);
           break;
+
+        case 'VIDEO_SYNC': {
+          if (playTimeoutRef.current) {
+            clearTimeout(playTimeoutRef.current);
+            playTimeoutRef.current = null;
+          }
+          // We dispatch a custom event so the room view can react
+          window.dispatchEvent(new CustomEvent('yt-sync', { detail: data }));
+          break;
+        }
       }
     };
+    } // end connect()
+
+    connect();
 
     return () => {
+      intentionalClose = true;
       clearInterval(resyncTimer);
+      clearInterval(heartbeatTimer);
+      clearTimeout(reconnectTimer);
       stopDriftCorrection();
       if (playTimeoutRef.current) clearTimeout(playTimeoutRef.current);
-      socket.close();
+      if (socket) socket.close();
       audioRef.current.pause();
     };
+  }, []);
+
+  // Reconnect on visibility change (phone wakes up from sleep)
+  useEffect(() => {
+    const handleVisibility = () => {
+      if (document.visibilityState === 'visible') {
+        const ws = socketRef.current;
+        if (!ws || ws.readyState === WebSocket.CLOSED || ws.readyState === WebSocket.CLOSING) {
+          setConnected(false);
+        }
+      }
+    };
+    document.addEventListener('visibilitychange', handleVisibility);
+    return () => document.removeEventListener('visibilitychange', handleVisibility);
   }, []);
 
   const send = (payload) => {
@@ -231,9 +312,40 @@ export default function App() {
     if (ws?.readyState === WebSocket.OPEN) ws.send(JSON.stringify(payload));
   };
 
+  // ─── YouTube helpers ───
+  const parseYoutubeId = (url) => {
+    const patterns = [
+      /(?:youtube\.com\/watch\?v=|youtu\.be\/|youtube\.com\/embed\/|youtube\.com\/shorts\/)([a-zA-Z0-9_-]{11})/,
+    ];
+    for (const p of patterns) {
+      const match = url.match(p);
+      if (match) return match[1];
+    }
+    return '';
+  };
+
+  // Load YT IFrame API once
+  useEffect(() => {
+    if (window.YT) return;
+    const tag = document.createElement('script');
+    tag.src = 'https://www.youtube.com/iframe_api';
+    document.head.appendChild(tag);
+  }, []);
+
   // ─── Upload & Create Room ───
   const handleCreate = async () => {
     if (!password) return;
+
+    if (musicSource === 'youtube') {
+      const vid = parseYoutubeId(youtubeUrl);
+      if (!vid) return alert('Invalid YouTube URL');
+      setVideoId(vid);
+      setRoomType('youtube');
+      setSongName('YouTube Video');
+      send({ type: 'CREATE_ROOM', password, musicUrl: '', roomType: 'youtube', videoId: vid, songName: 'YouTube Video', coverArt: `https://img.youtube.com/vi/${vid}/hqdefault.jpg` });
+      setCoverArt(`https://img.youtube.com/vi/${vid}/hqdefault.jpg`);
+      return;
+    }
 
     if (musicSource === 'spotify') {
       // Spotify: use the preview URL directly
@@ -401,6 +513,32 @@ export default function App() {
   };
 
   // ─── Views ───
+  if (view === 'room' && roomType === 'youtube') {
+    return <YouTubeRoom
+      videoId={videoId}
+      songName={songName}
+      coverArt={coverArt}
+      connected={connected}
+      roomKey={roomKey || joinKey}
+      copyKey={copyKey}
+      copied={copied}
+      listenerCount={listenerCount}
+      chatMessages={chatMessages}
+      chatInput={chatInput}
+      setChatInput={setChatInput}
+      chatOpen={chatOpen}
+      setChatOpen={setChatOpen}
+      nickname={nickname}
+      setNickname={setNickname}
+      sendChat={sendChat}
+      chatEndRef={chatEndRef}
+      send={send}
+      clockOffsetRef={clockOffsetRef}
+      playTimeoutRef={playTimeoutRef}
+      syncStateRef={syncStateRef}
+    />;
+  }
+
   if (view === 'room') {
     return (
       <Shell connected={connected}>
@@ -599,7 +737,7 @@ export default function App() {
 
   if (view === 'create') {
     const canCreate = password && connected && !uploading &&
-      (musicSource === 'upload' ? !!file : !!selectedTrack?.previewUrl);
+      (musicSource === 'upload' ? !!file : musicSource === 'spotify' ? !!selectedTrack?.previewUrl : !!parseYoutubeId(youtubeUrl));
 
     return (
       <Shell connected={connected}>
@@ -613,7 +751,7 @@ export default function App() {
             {/* ── Source tabs ── */}
             <div className="flex rounded-lg bg-zinc-800 p-1 gap-1">
               <button
-                onClick={() => { setMusicSource('upload'); setSelectedTrack(null); }}
+                onClick={() => { setMusicSource('upload'); setSelectedTrack(null); setYoutubeUrl(''); }}
                 className={`flex-1 flex items-center justify-center gap-1.5 rounded-md px-3 py-2 text-sm font-medium transition-colors cursor-pointer ${
                   musicSource === 'upload' ? 'bg-zinc-700 text-white' : 'text-zinc-400 hover:text-zinc-200'
                 }`}
@@ -621,12 +759,20 @@ export default function App() {
                 <Upload className="h-4 w-4" /> Upload
               </button>
               <button
-                onClick={() => { setMusicSource('spotify'); setFile(null); }}
+                onClick={() => { setMusicSource('spotify'); setFile(null); setYoutubeUrl(''); }}
                 className={`flex-1 flex items-center justify-center gap-1.5 rounded-md px-3 py-2 text-sm font-medium transition-colors cursor-pointer ${
                   musicSource === 'spotify' ? 'bg-emerald-600 text-white' : 'text-zinc-400 hover:text-zinc-200'
                 }`}
               >
                 <Disc3 className="h-4 w-4" /> Spotify
+              </button>
+              <button
+                onClick={() => { setMusicSource('youtube'); setFile(null); setSelectedTrack(null); }}
+                className={`flex-1 flex items-center justify-center gap-1.5 rounded-md px-3 py-2 text-sm font-medium transition-colors cursor-pointer ${
+                  musicSource === 'youtube' ? 'bg-red-600 text-white' : 'text-zinc-400 hover:text-zinc-200'
+                }`}
+              >
+                <Youtube className="h-4 w-4" /> YouTube
               </button>
             </div>
 
@@ -711,6 +857,34 @@ export default function App() {
               </div>
             )}
 
+            {/* ── YouTube tab ── */}
+            {musicSource === 'youtube' && (
+              <div className="flex flex-col gap-3">
+                <Input
+                  placeholder="Paste YouTube video URL..."
+                  value={youtubeUrl}
+                  onChange={(e) => setYoutubeUrl(e.target.value)}
+                />
+                {parseYoutubeId(youtubeUrl) && (
+                  <div className="rounded-xl overflow-hidden border border-zinc-800">
+                    <img
+                      src={`https://img.youtube.com/vi/${parseYoutubeId(youtubeUrl)}/hqdefault.jpg`}
+                      alt="Video thumbnail"
+                      className="w-full aspect-video object-cover"
+                    />
+                    <div className="flex items-center gap-2 p-3 bg-zinc-900">
+                      <Youtube className="h-4 w-4 text-red-500 shrink-0" />
+                      <span className="text-xs text-zinc-400 truncate">Video ID: {parseYoutubeId(youtubeUrl)}</span>
+                      <Check className="h-3 w-3 text-emerald-400 ml-auto shrink-0" />
+                    </div>
+                  </div>
+                )}
+                <p className="text-xs text-zinc-600 text-center">
+                  Everyone loads the video from YouTube — only controls are synced
+                </p>
+              </div>
+            )}
+
             <Input
               type="password"
               placeholder="Room password"
@@ -776,7 +950,7 @@ export default function App() {
         </div>
         <h1 className="text-3xl font-bold tracking-tight text-white">SyncMusic</h1>
         <p className="text-zinc-400 text-center max-w-xs">
-          Listen to music together in perfect sync — no matter where you are.
+          Listen to music or watch videos together in perfect sync — no matter where you are.
         </p>
       </div>
 
@@ -791,7 +965,7 @@ export default function App() {
             </div>
             <div>
               <p className="font-medium text-white">Create a Room</p>
-              <p className="text-sm text-zinc-500">Upload a song or pick from Spotify</p>
+              <p className="text-sm text-zinc-500">Upload a song, Spotify, or YouTube</p>
             </div>
           </CardContent>
         </Card>
@@ -809,6 +983,300 @@ export default function App() {
               <p className="text-sm text-zinc-500">Enter a key to listen with friends</p>
             </div>
           </CardContent>
+        </Card>
+      </div>
+    </Shell>
+  );
+}
+
+// ─── YouTube Room Component ───
+function YouTubeRoom({
+  videoId, songName, coverArt, connected, roomKey, copyKey, copied,
+  listenerCount, chatMessages, chatInput, setChatInput, chatOpen, setChatOpen,
+  nickname, setNickname, sendChat, chatEndRef, send, clockOffsetRef,
+  playTimeoutRef, syncStateRef
+}) {
+  const playerRef = useRef(null);
+  const containerRef = useRef(null);
+  const driftRef = useRef(null);
+  const [ytReady, setYtReady] = useState(false);
+  const [ytPlaying, setYtPlaying] = useState(false);
+  const [ytProgress, setYtProgress] = useState(0);
+  const [ytDuration, setYtDuration] = useState(0);
+
+  const formatTime = (sec) => {
+    if (!sec || !isFinite(sec)) return '0:00';
+    const m = Math.floor(sec / 60);
+    const s = Math.floor(sec % 60);
+    return `${m}:${s.toString().padStart(2, '0')}`;
+  };
+
+  // Init YT player
+  useEffect(() => {
+    let player = null;
+
+    const create = () => {
+      player = new window.YT.Player(containerRef.current, {
+        videoId,
+        playerVars: { autoplay: 0, controls: 0, modestbranding: 1, rel: 0, disablekb: 1 },
+        events: {
+          onReady: () => {
+            playerRef.current = player;
+            setYtReady(true);
+            setYtDuration(player.getDuration());
+          },
+          onStateChange: (e) => {
+            // just track state locally — actual control comes from WS
+            if (e.data === window.YT.PlayerState.PLAYING) setYtPlaying(true);
+            else if (e.data === window.YT.PlayerState.PAUSED) setYtPlaying(false);
+          }
+        }
+      });
+    };
+
+    if (window.YT && window.YT.Player) {
+      create();
+    } else {
+      window.onYouTubeIframeAPIReady = create;
+    }
+
+    return () => {
+      if (player && player.destroy) player.destroy();
+      if (driftRef.current) clearInterval(driftRef.current);
+    };
+  }, [videoId]);
+
+  // Progress tracker
+  useEffect(() => {
+    const iv = setInterval(() => {
+      if (playerRef.current && typeof playerRef.current.getCurrentTime === 'function') {
+        setYtProgress(playerRef.current.getCurrentTime());
+        const d = playerRef.current.getDuration();
+        if (d) setYtDuration(d);
+      }
+    }, 500);
+    return () => clearInterval(iv);
+  }, []);
+
+  // Handle VIDEO_SYNC events from server
+  useEffect(() => {
+    const handler = (e) => {
+      const data = e.detail;
+      const player = playerRef.current;
+      if (!player || !ytReady) return;
+
+      if (playTimeoutRef.current) {
+        clearTimeout(playTimeoutRef.current);
+        playTimeoutRef.current = null;
+      }
+      if (driftRef.current) {
+        clearInterval(driftRef.current);
+        driftRef.current = null;
+      }
+
+      if (data.action === 'PLAY') {
+        syncStateRef.current = { startAt: data.startAt, playFrom: data.time };
+        const localStart = data.startAt - clockOffsetRef.current;
+        const delay = localStart - Date.now();
+
+        player.seekTo(data.time, true);
+
+        if (delay > 0) {
+          player.pauseVideo();
+          playTimeoutRef.current = setTimeout(() => {
+            player.playVideo();
+            setYtPlaying(true);
+            startYtDrift(player);
+          }, delay);
+        } else {
+          player.seekTo(data.time + Math.abs(delay) / 1000, true);
+          player.playVideo();
+          setYtPlaying(true);
+          startYtDrift(player);
+        }
+      } else {
+        player.pauseVideo();
+        player.seekTo(data.time, true);
+        setYtPlaying(false);
+      }
+    };
+
+    const startYtDrift = (player) => {
+      driftRef.current = setInterval(() => {
+        if (!player || typeof player.getCurrentTime !== 'function') return;
+        const state = player.getPlayerState();
+        if (state !== window.YT.PlayerState.PLAYING) return;
+        const { startAt, playFrom } = syncStateRef.current;
+        if (!startAt) return;
+        const serverNow = Date.now() + clockOffsetRef.current;
+        const expected = playFrom + (serverNow - startAt) / 1000;
+        const drift = player.getCurrentTime() - expected;
+        if (Math.abs(drift) > 0.3) {
+          player.seekTo(expected, true);
+        }
+      }, 3000);
+    };
+
+    window.addEventListener('yt-sync', handler);
+    return () => window.removeEventListener('yt-sync', handler);
+  }, [ytReady, clockOffsetRef, playTimeoutRef, syncStateRef]);
+
+  const handleYtPlay = () => send({ type: 'VIDEO_CONTROL', action: 'PLAY' });
+  const handleYtPause = () => {
+    const t = playerRef.current?.getCurrentTime() || 0;
+    send({ type: 'VIDEO_CONTROL', action: 'PAUSE', time: t });
+  };
+  const handleYtSeek = (time) => send({ type: 'VIDEO_CONTROL', action: 'SEEK', time });
+
+  return (
+    <Shell connected={connected}>
+      <div className="flex w-full max-w-3xl gap-4 flex-col lg:flex-row">
+        <Card className="w-full flex-1">
+          <CardContent className="flex flex-col items-center gap-4 p-6">
+            {/* Room info */}
+            <div className="flex w-full items-center justify-between">
+              <div className="flex items-center gap-2">
+                <div className="flex items-center gap-1.5 rounded-full bg-red-500/10 px-3 py-1">
+                  <Youtube className="h-3 w-3 text-red-500" />
+                  <span className="text-xs font-medium text-red-400">LIVE VIDEO</span>
+                </div>
+                <div className="flex items-center gap-1 text-xs text-zinc-500">
+                  <Users className="h-3 w-3" />
+                  <span>{listenerCount} watching</span>
+                </div>
+              </div>
+              <div className="flex items-center gap-2">
+                <code className="font-mono text-xs text-zinc-500">{roomKey}</code>
+                <button onClick={copyKey} className="text-zinc-500 hover:text-white transition-colors cursor-pointer">
+                  {copied ? <Check className="h-3 w-3 text-emerald-400" /> : <Copy className="h-3 w-3" />}
+                </button>
+              </div>
+            </div>
+
+            {/* YouTube embed */}
+            <div className="w-full aspect-video rounded-xl overflow-hidden bg-black">
+              <div ref={containerRef} className="w-full h-full" />
+            </div>
+
+            {/* Progress bar */}
+            <div className="w-full flex flex-col gap-1">
+              <div
+                className="relative w-full h-1.5 bg-zinc-800 rounded-full cursor-pointer group"
+                onClick={(e) => {
+                  if (!ytDuration) return;
+                  const rect = e.currentTarget.getBoundingClientRect();
+                  const pct = Math.max(0, Math.min(1, (e.clientX - rect.left) / rect.width));
+                  handleYtSeek(pct * ytDuration);
+                }}
+              >
+                <div
+                  className="absolute top-0 left-0 h-full bg-red-500 rounded-full transition-all"
+                  style={{ width: `${ytDuration ? (ytProgress / ytDuration) * 100 : 0}%` }}
+                />
+                <div
+                  className="absolute top-1/2 -translate-y-1/2 h-3 w-3 bg-white rounded-full shadow opacity-0 group-hover:opacity-100 transition-opacity"
+                  style={{ left: `${ytDuration ? (ytProgress / ytDuration) * 100 : 0}%`, transform: 'translate(-50%, -50%)' }}
+                />
+              </div>
+              <div className="flex justify-between text-[10px] text-zinc-600">
+                <span>{formatTime(ytProgress)}</span>
+                <span>{formatTime(ytDuration)}</span>
+              </div>
+            </div>
+
+            {/* Controls */}
+            <div className="flex items-center gap-3 w-full justify-center">
+              <button
+                onClick={() => handleYtSeek(Math.max(0, ytProgress - 10))}
+                className="text-zinc-500 hover:text-white transition-colors cursor-pointer"
+              >
+                <SkipBack className="h-5 w-5" />
+              </button>
+
+              <Button
+                variant="primary"
+                size="lg"
+                className="w-14 h-14 rounded-full p-0 flex items-center justify-center"
+                onClick={ytPlaying ? handleYtPause : handleYtPlay}
+                disabled={!ytReady}
+              >
+                {ytPlaying ? <Pause className="h-6 w-6" /> : <Play className="h-6 w-6 ml-0.5" />}
+              </Button>
+
+              <button
+                onClick={() => handleYtSeek(Math.min(ytDuration || 0, ytProgress + 10))}
+                className="text-zinc-500 hover:text-white transition-colors cursor-pointer"
+              >
+                <SkipForward className="h-5 w-5" />
+              </button>
+            </div>
+
+            <p className="text-[10px] text-zinc-700 text-center">Video loads from YouTube on each device — only controls are synced</p>
+          </CardContent>
+        </Card>
+
+        {/* Chat panel (reused) */}
+        <Card className={`w-full lg:w-72 flex flex-col transition-all ${chatOpen ? 'max-h-[500px]' : 'max-h-12 overflow-hidden'}`}>
+          <button
+            onClick={() => setChatOpen(!chatOpen)}
+            className="flex items-center gap-2 p-3 text-sm font-medium text-zinc-300 hover:text-white transition-colors cursor-pointer shrink-0"
+          >
+            <MessageCircle className="h-4 w-4 text-violet-400" />
+            Live Chat
+            {chatMessages.length > 0 && (
+              <span className="ml-auto text-[10px] bg-violet-500/20 text-violet-400 rounded-full px-2 py-0.5">
+                {chatMessages.length}
+              </span>
+            )}
+          </button>
+          {chatOpen && (
+            <>
+              <div className="flex-1 overflow-y-auto px-3 space-y-2 min-h-[200px] max-h-[350px]">
+                {chatMessages.length === 0 && (
+                  <p className="text-xs text-zinc-700 text-center py-8">No messages yet</p>
+                )}
+                {chatMessages.map((msg, i) => (
+                  <div key={i} className="text-xs">
+                    <span className="font-medium text-violet-400">{msg.sender}: </span>
+                    <span className="text-zinc-400">{msg.text}</span>
+                  </div>
+                ))}
+                <div ref={chatEndRef} />
+              </div>
+              <div className="flex gap-2 p-3 border-t border-zinc-800">
+                <Input
+                  placeholder={nickname ? 'Message...' : 'Set nickname first'}
+                  value={nickname ? chatInput : nickname}
+                  onChange={(e) => nickname ? setChatInput(e.target.value) : null}
+                  onKeyDown={(e) => e.key === 'Enter' && nickname && sendChat()}
+                  className="text-xs h-8"
+                />
+                {!nickname ? (
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    className="h-8 px-2 shrink-0"
+                    onClick={() => {
+                      const name = prompt('Enter your nickname (max 20 chars):');
+                      if (name) setNickname(name.slice(0, 20));
+                    }}
+                  >
+                    <Users className="h-3 w-3" />
+                  </Button>
+                ) : (
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    className="h-8 px-2 shrink-0"
+                    onClick={sendChat}
+                    disabled={!chatInput.trim()}
+                  >
+                    <Send className="h-3 w-3" />
+                  </Button>
+                )}
+              </div>
+            </>
+          )}
         </Card>
       </div>
     </Shell>
