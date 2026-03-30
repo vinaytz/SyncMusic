@@ -119,8 +119,11 @@ wss.on('connection', (ws) => {
 
     ws.on('pong', () => { ws.isAlive = true; });
 
+    ws.on('error', (err) => console.error('WebSocket error:', err.message));
+
     ws.on('message', (data) => {
-        const message = JSON.parse(data);
+        let message;
+        try { message = JSON.parse(data); } catch { return; }
 
         switch (message.type) {
             case 'PING':
@@ -366,4 +369,8 @@ const keepAliveInterval = setInterval(() => {
 }, 25_000);
 
 wss.on('close', () => clearInterval(keepAliveInterval));
+
+// Prevent server crash on unhandled errors
+process.on('uncaughtException', (err) => console.error('Uncaught:', err.message));
+process.on('unhandledRejection', (err) => console.error('Unhandled rejection:', err));
 
