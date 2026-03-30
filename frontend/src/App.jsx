@@ -1,6 +1,7 @@
-import { useState, useEffect, useRef } from 'react';
+import { useState, useEffect, useRef, useCallback } from 'react';
 import {
-  Music, Upload, Play, Pause, Radio, Copy, Check, Loader2, Users, LogIn, Plus, Wifi, WifiOff, Search, X, Disc3
+  Music, Upload, Play, Pause, Radio, Copy, Check, Loader2, Users, LogIn, Plus, Wifi, WifiOff, Search, X, Disc3,
+  Volume2, VolumeX, Send, SkipBack, SkipForward, MessageCircle
 } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
@@ -35,6 +36,18 @@ export default function App() {
   const [joinKey, setJoinKey] = useState('');
   const [joinPassword, setJoinPassword] = useState('');
 
+  // Advanced features
+  const [listenerCount, setListenerCount] = useState(0);
+  const [volume, setVolume] = useState(1);
+  const [muted, setMuted] = useState(false);
+  const [progress, setProgress] = useState(0);
+  const [duration, setDuration] = useState(0);
+  const [chatMessages, setChatMessages] = useState([]);
+  const [chatInput, setChatInput] = useState('');
+  const [chatOpen, setChatOpen] = useState(false);
+  const [nickname, setNickname] = useState('');
+  const [coverArt, setCoverArt] = useState('');
+
   // Refs
   const socketRef = useRef(null);
   const audioRef = useRef(new Audio());
@@ -42,6 +55,12 @@ export default function App() {
   const playTimeoutRef = useRef(null);
   const driftIntervalRef = useRef(null);
   const syncStateRef = useRef({ startAt: 0, playFrom: 0 });
+  const canvasRef = useRef(null);
+  const analyserRef = useRef(null);
+  const animFrameRef = useRef(null);
+  const audioCtxRef = useRef(null);
+  const sourceNodeRef = useRef(null);
+  const chatEndRef = useRef(null);
 
   // ─── WebSocket connection + clock sync ───
   useEffect(() => {
@@ -135,7 +154,8 @@ export default function App() {
 
         case 'JOIN_SUCCESS':
           audioRef.current.src = data.musicUrl;
-          setSongName(data.musicUrl.split('/').pop().split('?')[0]);
+          setSongName(data.songName || data.musicUrl.split('/').pop().split('?')[0]);
+          if (data.coverArt) setCoverArt(data.coverArt);
           setView('room');
           if (data.isPlaying && data.currentTime != null) {
             const audio = audioRef.current;
@@ -186,6 +206,14 @@ export default function App() {
         case 'ERROR':
           alert(data.message);
           break;
+
+        case 'LISTENER_COUNT':
+          setListenerCount(data.count);
+          break;
+
+        case 'CHAT':
+          setChatMessages(prev => [...prev.slice(-100), data]);
+          break;
       }
     };
 
@@ -211,7 +239,8 @@ export default function App() {
       // Spotify: use the preview URL directly
       if (!selectedTrack?.previewUrl) return;
       setSongName(`${selectedTrack.name} — ${selectedTrack.artist}`);
-      send({ type: 'CREATE_ROOM', password, musicUrl: selectedTrack.previewUrl });
+      setCoverArt(selectedTrack.cover || '');
+      send({ type: 'CREATE_ROOM', password, musicUrl: selectedTrack.previewUrl, songName: `${selectedTrack.name} — ${selectedTrack.artist}`, coverArt: selectedTrack.cover || '' });
       return;
     }
 
@@ -225,7 +254,7 @@ export default function App() {
       const { url } = await res.json();
       if (!url) throw new Error('Upload failed');
       setSongName(file.name);
-      send({ type: 'CREATE_ROOM', password, musicUrl: url });
+      send({ type: 'CREATE_ROOM', password, musicUrl: url, songName: file.name, coverArt: '' });
     } catch (err) {
       alert('Upload failed. Try again.');
     } finally {
@@ -257,6 +286,106 @@ export default function App() {
   // ─── Controls ───
   const handlePlay = () => send({ type: 'CONTROL', action: 'PLAY' });
   const handlePause = () => send({ type: 'CONTROL', action: 'PAUSE', time: audioRef.current.currentTime });
+  const handleSeek = (time) => send({ type: 'CONTROL', action: 'SEEK', time });
+
+  const handleVolumeChange = (v) => {
+    setVolume(v);
+    audioRef.current.volume = v;
+    if (v > 0) setMuted(false);
+  };
+
+  const toggleMute = () => {
+    if (muted) {
+      audioRef.current.volume = volume || 0.5;
+      setMuted(false);
+    } else {
+      audioRef.current.volume = 0;
+      setMuted(true);
+    }
+  };
+
+  const sendChat = () => {
+    const text = chatInput.trim();
+    if (!text) return;
+    send({ type: 'CHAT', text, sender: nickname || 'Anon' });
+    setChatInput('');
+  };
+
+  // ─── Progress tracking ───
+  useEffect(() => {
+    const audio = audioRef.current;
+    const updateProgress = () => {
+      if (audio.duration) {
+        setProgress(audio.currentTime);
+        setDuration(audio.duration);
+      }
+    };
+    audio.addEventListener('timeupdate', updateProgress);
+    audio.addEventListener('loadedmetadata', () => setDuration(audio.duration));
+    return () => {
+      audio.removeEventListener('timeupdate', updateProgress);
+    };
+  }, []);
+
+  // ─── Audio Visualizer ───
+  const initVisualizer = useCallback(() => {
+    if (audioCtxRef.current) return;
+    const ctx = new (window.AudioContext || window.webkitAudioContext)();
+    audioCtxRef.current = ctx;
+    const analyser = ctx.createAnalyser();
+    analyser.fftSize = 256;
+    analyserRef.current = analyser;
+    const source = ctx.createMediaElementSource(audioRef.current);
+    source.connect(analyser);
+    analyser.connect(ctx.destination);
+    sourceNodeRef.current = source;
+  }, []);
+
+  const drawVisualizer = useCallback(() => {
+    const canvas = canvasRef.current;
+    const analyser = analyserRef.current;
+    if (!canvas || !analyser) return;
+    const canvasCtx = canvas.getContext('2d');
+    const bufferLength = analyser.frequencyBinCount;
+    const dataArray = new Uint8Array(bufferLength);
+
+    const draw = () => {
+      animFrameRef.current = requestAnimationFrame(draw);
+      analyser.getByteFrequencyData(dataArray);
+      canvasCtx.clearRect(0, 0, canvas.width, canvas.height);
+
+      const barWidth = (canvas.width / bufferLength) * 2.5;
+      let x = 0;
+      for (let i = 0; i < bufferLength; i++) {
+        const barHeight = (dataArray[i] / 255) * canvas.height;
+        const hue = (i / bufferLength) * 60 + 250;
+        canvasCtx.fillStyle = `hsla(${hue}, 80%, 60%, 0.8)`;
+        canvasCtx.fillRect(x, canvas.height - barHeight, barWidth, barHeight);
+        x += barWidth + 1;
+      }
+    };
+    draw();
+  }, []);
+
+  useEffect(() => {
+    if (isPlaying && view === 'room') {
+      initVisualizer();
+      drawVisualizer();
+    } else {
+      if (animFrameRef.current) {
+        cancelAnimationFrame(animFrameRef.current);
+        animFrameRef.current = null;
+      }
+    }
+    return () => {
+      if (animFrameRef.current) cancelAnimationFrame(animFrameRef.current);
+    };
+  }, [isPlaying, view, initVisualizer, drawVisualizer]);
+
+  // Auto-scroll chat
+  useEffect(() => {
+    chatEndRef.current?.scrollIntoView({ behavior: 'smooth' });
+  }, [chatMessages]);
 
   const copyKey = () => {
     navigator.clipboard.writeText(roomKey);
@@ -264,49 +393,206 @@ export default function App() {
     setTimeout(() => setCopied(false), 2000);
   };
 
+  const formatTime = (sec) => {
+    if (!sec || !isFinite(sec)) return '0:00';
+    const m = Math.floor(sec / 60);
+    const s = Math.floor(sec % 60);
+    return `${m}:${s.toString().padStart(2, '0')}`;
+  };
+
   // ─── Views ───
   if (view === 'room') {
     return (
       <Shell connected={connected}>
-        <Card className="w-full max-w-md">
-          <CardHeader className="text-center">
-            <div className="mx-auto mb-2 flex h-12 w-12 items-center justify-center rounded-full bg-violet-500/10">
-              <Radio className="h-6 w-6 text-violet-400" />
-            </div>
-            <CardTitle>Live Room</CardTitle>
-            <CardDescription>Everyone hears the same thing, at the same time.</CardDescription>
-          </CardHeader>
-          <CardContent className="flex flex-col items-center gap-5">
-            {/* Room key */}
-            <div className="flex w-full items-center gap-2 rounded-lg bg-zinc-800 px-4 py-3">
-              <span className="text-xs text-zinc-500 uppercase tracking-wider">Room Key</span>
-              <code className="ml-auto font-mono text-sm text-violet-400">{roomKey || joinKey}</code>
-              <button onClick={copyKey} className="text-zinc-500 hover:text-white transition-colors cursor-pointer">
-                {copied ? <Check className="h-4 w-4 text-emerald-400" /> : <Copy className="h-4 w-4" />}
-              </button>
-            </div>
-
-            {/* Song name */}
-            {songName && (
-              <div className="flex items-center gap-2 text-sm text-zinc-400">
-                <Music className="h-4 w-4" />
-                <span className="truncate max-w-[200px]">{songName}</span>
+        <div className="flex w-full max-w-2xl gap-4 flex-col lg:flex-row">
+          {/* Main player card */}
+          <Card className="w-full flex-1">
+            <CardContent className="flex flex-col items-center gap-4 p-6">
+              {/* Room info bar */}
+              <div className="flex w-full items-center justify-between">
+                <div className="flex items-center gap-2">
+                  <div className="flex items-center gap-1.5 rounded-full bg-violet-500/10 px-3 py-1">
+                    <Radio className="h-3 w-3 text-violet-400 animate-pulse" />
+                    <span className="text-xs font-medium text-violet-400">LIVE</span>
+                  </div>
+                  <div className="flex items-center gap-1 text-xs text-zinc-500">
+                    <Users className="h-3 w-3" />
+                    <span>{listenerCount} listening</span>
+                  </div>
+                </div>
+                <div className="flex items-center gap-2">
+                  <code className="font-mono text-xs text-zinc-500">{roomKey || joinKey}</code>
+                  <button onClick={copyKey} className="text-zinc-500 hover:text-white transition-colors cursor-pointer">
+                    {copied ? <Check className="h-3 w-3 text-emerald-400" /> : <Copy className="h-3 w-3" />}
+                  </button>
+                </div>
               </div>
-            )}
 
-            {/* Play / Pause */}
-            <Button
-              variant="primary"
-              size="lg"
-              className="w-40 rounded-full"
-              onClick={isPlaying ? handlePause : handlePlay}
+              {/* Cover art + visualizer */}
+              <div className="relative w-full aspect-[2/1] rounded-xl overflow-hidden bg-zinc-900/50">
+                {coverArt ? (
+                  <img src={coverArt} alt="" className="absolute inset-0 w-full h-full object-cover opacity-30 blur-md scale-110" />
+                ) : null}
+                <canvas
+                  ref={canvasRef}
+                  width={500}
+                  height={200}
+                  className="relative w-full h-full"
+                />
+                {!isPlaying && (
+                  <div className="absolute inset-0 flex items-center justify-center bg-black/40">
+                    <div className="flex flex-col items-center gap-2">
+                      {coverArt && <img src={coverArt} alt="" className="h-16 w-16 rounded-lg shadow-lg" />}
+                      <p className="text-sm font-medium text-white">{songName || 'Ready to play'}</p>
+                    </div>
+                  </div>
+                )}
+              </div>
+
+              {/* Song name */}
+              {songName && (
+                <div className="flex items-center gap-2 text-sm text-zinc-300 w-full">
+                  <Music className="h-4 w-4 text-violet-400 shrink-0" />
+                  <span className="truncate font-medium">{songName}</span>
+                </div>
+              )}
+
+              {/* Progress bar */}
+              <div className="w-full flex flex-col gap-1">
+                <div
+                  className="relative w-full h-1.5 bg-zinc-800 rounded-full cursor-pointer group"
+                  onClick={(e) => {
+                    if (!duration) return;
+                    const rect = e.currentTarget.getBoundingClientRect();
+                    const pct = Math.max(0, Math.min(1, (e.clientX - rect.left) / rect.width));
+                    handleSeek(pct * duration);
+                  }}
+                >
+                  <div
+                    className="absolute top-0 left-0 h-full bg-violet-500 rounded-full transition-all"
+                    style={{ width: `${duration ? (progress / duration) * 100 : 0}%` }}
+                  />
+                  <div
+                    className="absolute top-1/2 -translate-y-1/2 h-3 w-3 bg-white rounded-full shadow opacity-0 group-hover:opacity-100 transition-opacity"
+                    style={{ left: `${duration ? (progress / duration) * 100 : 0}%`, transform: 'translate(-50%, -50%)' }}
+                  />
+                </div>
+                <div className="flex justify-between text-[10px] text-zinc-600">
+                  <span>{formatTime(progress)}</span>
+                  <span>{formatTime(duration)}</span>
+                </div>
+              </div>
+
+              {/* Controls row */}
+              <div className="flex items-center gap-3 w-full justify-center">
+                <button
+                  onClick={() => handleSeek(Math.max(0, progress - 10))}
+                  className="text-zinc-500 hover:text-white transition-colors cursor-pointer"
+                >
+                  <SkipBack className="h-5 w-5" />
+                </button>
+
+                <Button
+                  variant="primary"
+                  size="lg"
+                  className="w-14 h-14 rounded-full p-0 flex items-center justify-center"
+                  onClick={isPlaying ? handlePause : handlePlay}
+                >
+                  {isPlaying ? <Pause className="h-6 w-6" /> : <Play className="h-6 w-6 ml-0.5" />}
+                </Button>
+
+                <button
+                  onClick={() => handleSeek(Math.min(duration || 0, progress + 10))}
+                  className="text-zinc-500 hover:text-white transition-colors cursor-pointer"
+                >
+                  <SkipForward className="h-5 w-5" />
+                </button>
+              </div>
+
+              {/* Volume */}
+              <div className="flex items-center gap-2 w-full">
+                <button onClick={toggleMute} className="text-zinc-500 hover:text-white transition-colors cursor-pointer">
+                  {muted || volume === 0 ? <VolumeX className="h-4 w-4" /> : <Volume2 className="h-4 w-4" />}
+                </button>
+                <input
+                  type="range"
+                  min="0"
+                  max="1"
+                  step="0.01"
+                  value={muted ? 0 : volume}
+                  onChange={(e) => handleVolumeChange(parseFloat(e.target.value))}
+                  className="flex-1 h-1 accent-violet-500 cursor-pointer"
+                />
+              </div>
+
+              <p className="text-[10px] text-zinc-700 text-center">Open in multiple tabs / devices to test sync</p>
+            </CardContent>
+          </Card>
+
+          {/* Chat panel */}
+          <Card className={`w-full lg:w-72 flex flex-col transition-all ${chatOpen ? 'max-h-[500px]' : 'max-h-12 overflow-hidden'}`}>
+            <button
+              onClick={() => setChatOpen(!chatOpen)}
+              className="flex items-center gap-2 p-3 text-sm font-medium text-zinc-300 hover:text-white transition-colors cursor-pointer shrink-0"
             >
-              {isPlaying ? <><Pause className="h-5 w-5" /> Pause</> : <><Play className="h-5 w-5" /> Play</>}
-            </Button>
-
-            <p className="text-xs text-zinc-600">Open in multiple tabs / devices to test sync</p>
-          </CardContent>
-        </Card>
+              <MessageCircle className="h-4 w-4 text-violet-400" />
+              Live Chat
+              {chatMessages.length > 0 && (
+                <span className="ml-auto text-[10px] bg-violet-500/20 text-violet-400 rounded-full px-2 py-0.5">
+                  {chatMessages.length}
+                </span>
+              )}
+            </button>
+            {chatOpen && (
+              <>
+                <div className="flex-1 overflow-y-auto px-3 space-y-2 min-h-[200px] max-h-[350px]">
+                  {chatMessages.length === 0 && (
+                    <p className="text-xs text-zinc-700 text-center py-8">No messages yet</p>
+                  )}
+                  {chatMessages.map((msg, i) => (
+                    <div key={i} className="text-xs">
+                      <span className="font-medium text-violet-400">{msg.sender}: </span>
+                      <span className="text-zinc-400">{msg.text}</span>
+                    </div>
+                  ))}
+                  <div ref={chatEndRef} />
+                </div>
+                <div className="flex gap-2 p-3 border-t border-zinc-800">
+                  <Input
+                    placeholder={nickname ? 'Message...' : 'Set nickname first'}
+                    value={nickname ? chatInput : nickname}
+                    onChange={(e) => nickname ? setChatInput(e.target.value) : null}
+                    onKeyDown={(e) => e.key === 'Enter' && nickname && sendChat()}
+                    className="text-xs h-8"
+                  />
+                  {!nickname ? (
+                    <Button
+                      variant="outline"
+                      size="sm"
+                      className="h-8 px-2 shrink-0"
+                      onClick={() => {
+                        const name = prompt('Enter your nickname (max 20 chars):');
+                        if (name) setNickname(name.slice(0, 20));
+                      }}
+                    >
+                      <Users className="h-3 w-3" />
+                    </Button>
+                  ) : (
+                    <Button
+                      variant="outline"
+                      size="sm"
+                      className="h-8 px-2 shrink-0"
+                      onClick={sendChat}
+                      disabled={!chatInput.trim()}
+                    >
+                      <Send className="h-3 w-3" />
+                    </Button>
+                  )}
+                </div>
+              </>
+            )}
+          </Card>
+        </div>
       </Shell>
     );
   }
